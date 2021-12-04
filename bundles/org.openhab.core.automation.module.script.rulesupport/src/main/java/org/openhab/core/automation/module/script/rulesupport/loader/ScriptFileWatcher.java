@@ -10,7 +10,7 @@
  *
  * SPDX-License-Identifier: EPL-2.0
  */
-package org.openhab.core.automation.module.script.rulesupport.internal.loader;
+package org.openhab.core.automation.module.script.rulesupport.loader;
 
 import static java.nio.file.StandardWatchEventKinds.*;
 
@@ -46,32 +46,26 @@ import org.openhab.core.service.ReadyMarker;
 import org.openhab.core.service.ReadyMarkerFilter;
 import org.openhab.core.service.ReadyService;
 import org.openhab.core.service.StartLevelService;
-import org.osgi.service.component.annotations.Activate;
-import org.osgi.service.component.annotations.Component;
-import org.osgi.service.component.annotations.Deactivate;
-import org.osgi.service.component.annotations.Reference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * The {@link ScriptFileWatcher} watches the jsr223 directory for files. If a new/modified file is detected, the script
+ * The {@link ScriptFileWatcher} watches a directory for files. If a new/modified file is detected, the script
  * is read and passed to the {@link ScriptEngineManager}.
  *
  * @author Simon Merschjohann - Initial contribution
  * @author Kai Kreuzer - improved logging and removed thread pool
- * @author Jonathan Gilbert - added dependency tracking & per-script start levels
+ * @author Jonathan Gilbert - added dependency tracking & per-script start levels; made reusable
  */
-@Component(immediate = true)
 public class ScriptFileWatcher extends AbstractWatchService implements ReadyService.ReadyTracker,
         DependencyTracker.DependencyChangeListener, ScriptEngineManager.FactoryChangeListener {
 
-    private static final String FILE_DIRECTORY = "automation" + File.separator + "jsr223";
     private static final long RECHECK_INTERVAL = 20;
 
     private final Logger logger = LoggerFactory.getLogger(ScriptFileWatcher.class);
 
     private final ScriptEngineManager manager;
-    private final DependencyTracker dependencyTracker;
+    private final Optional<DependencyTracker> dependencyTracker;
     private final ReadyService readyService;
 
     private @Nullable ScheduledExecutorService scheduler;
@@ -82,12 +76,11 @@ public class ScriptFileWatcher extends AbstractWatchService implements ReadyServ
 
     private volatile int currentStartLevel = 0;
 
-    @Activate
-    public ScriptFileWatcher(final @Reference ScriptEngineManager manager,
-            final @Reference DependencyTracker dependencyTracker, final @Reference ReadyService readyService) {
-        super(OpenHAB.getConfigFolder() + File.separator + FILE_DIRECTORY);
+    public ScriptFileWatcher(final ScriptEngineManager manager, final DependencyTracker dependencyTracker,
+            final ReadyService readyService, final String fileDirectory) {
+        super(OpenHAB.getConfigFolder() + File.separator + fileDirectory);
         this.manager = manager;
-        this.dependencyTracker = dependencyTracker;
+        this.dependencyTracker = Optional.ofNullable(dependencyTracker);
         this.readyService = readyService;
         this.executorFactory = () -> Executors
                 .newSingleThreadScheduledExecutor(new NamedThreadFactory("scriptwatcher"));
@@ -96,7 +89,6 @@ public class ScriptFileWatcher extends AbstractWatchService implements ReadyServ
         readyService.registerTracker(this, new ReadyMarkerFilter().withType(StartLevelService.STARTLEVEL_MARKER_TYPE));
     }
 
-    @Deactivate
     @Override
     public void deactivate() {
         manager.removeFactoryChangeListener(this);
@@ -178,7 +170,7 @@ public class ScriptFileWatcher extends AbstractWatchService implements ReadyServ
     private void removeFile(ScriptFileReference ref) {
         dequeueUrl(ref);
         String scriptIdentifier = ref.getScriptIdentifier();
-        dependencyTracker.removeScript(scriptIdentifier);
+        dependencyTracker.ifPresent(tracker -> tracker.removeScript(scriptIdentifier));
         manager.removeEngine(scriptIdentifier);
         loaded.remove(ref);
     }
@@ -199,7 +191,13 @@ public class ScriptFileWatcher extends AbstractWatchService implements ReadyServ
         });
     }
 
-    private void importFile(ScriptFileReference ref) {
+    protected void importFile(ScriptFileReference ref) {
+        if (createAndLoad(ref)) {
+            loaded.add(ref);
+        }
+    }
+
+    protected boolean createAndLoad(ScriptFileReference ref) {
         String fileName = ref.getScriptFileURL().getFile();
         Optional<String> scriptType = ref.getScriptType();
         assert scriptType.isPresent();
@@ -209,21 +207,25 @@ public class ScriptFileWatcher extends AbstractWatchService implements ReadyServ
             logger.info("Loading script '{}'", fileName);
 
             String scriptIdentifier = ref.getScriptIdentifier();
+
             ScriptEngineContainer container = manager.createScriptEngine(scriptType.get(), scriptIdentifier);
 
             if (container != null) {
                 container.getScriptEngine().put(ScriptEngine.FILENAME, fileName);
-                manager.loadScript(container.getIdentifier(), reader,
-                        dependency -> dependencyTracker.addLibForScript(scriptIdentifier, dependency));
+                manager.loadScript(container.getIdentifier(), reader, dependency -> dependencyTracker
+                        .ifPresent((it) -> it.addLibForScript(scriptIdentifier, dependency)));
 
-                loaded.add(ref);
                 logger.debug("Script loaded: {}", fileName);
+                return true;
             } else {
                 logger.error("Script loading error, ignoring file: {}", fileName);
             }
+
         } catch (IOException e) {
             logger.error("Failed to load file '{}': {}", ref.getScriptFileURL().getFile(), e.getMessage());
         }
+
+        return false;
     }
 
     private void enqueue(ScriptFileReference ref) {
